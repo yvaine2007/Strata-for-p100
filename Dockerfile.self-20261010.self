@@ -21,8 +21,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/strata
 COPY . .
 
+# 【新增】构建参数：目标 Strata 版本（由 workflow 传入）
+ARG STRATA_VERSION=v0.1.41
 ARG CUDA_ARCHITECTURES=60
 ARG BUILD_VISION=1
+
+# 【新增】checkout 到指定 Strata 版本（从上游 tag 拉取源码）
+# 为什么需要：workflow checkout 的是你 fork 的 main，源码版本不一定等于目标版本。
+# 这里显式切到指定 tag，保证镜像内容真正对应 STRATA_VERSION。
+RUN if [ -n "${STRATA_VERSION}" ]; then \
+        echo "=== Checking out Strata ${STRATA_VERSION} ===" && \
+        git remote add upstream https://github.com/Niko1221/Strata.git 2>/dev/null || true && \
+        git fetch --tags upstream && \
+        git fetch upstream --tags && \
+        git checkout ${STRATA_VERSION} && \
+        echo "=== Now at ===" && \
+        git log -1 --oneline && \
+        git describe --tags --exact-match 2>/dev/null || echo "(not on a tag)"; \
+    fi
 
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -79,6 +95,11 @@ meta = {
     "toolkit": 12,
 }
 (eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
+
+# 【新增】把版本信息写进镜像，方便追溯
+pathlib.Path("/opt/strata/REVISION.txt").write_text(
+    f"STRATA_VERSION={os.environ.get('STRATA_VERSION', 'unknown')}\n"
+)
 PYEOF
 
 RUN rm -rf build-cuda12 build-vision-cuda12
