@@ -28,20 +28,20 @@ jobs:
           fi
           echo "✅ 版本号格式正确: $V"
 
-      - name: Checkout at specified tag
+      # 【关键修改】checkout 你的 fork main，而不是上游 tag
+      # 原因：上游 tag 里没有你的 Dockerfile.self，必须从你的 fork 拿
+      - name: Checkout your fork main
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.strata_version }}
+          ref: main
           fetch-depth: 0
 
-      - name: Verify checked-out version
+      - name: Debug - verify Dockerfile exists
         run: |
-          echo "=== HEAD commit ==="
-          git log -1 --oneline
-          echo "=== Exact tag ==="
-          git describe --tags --exact-match 2>/dev/null || echo "(not exactly on a tag)"
-          echo "=== setup.py source version (if available) ==="
-          python3 -c "import setup; print('source_version:', setup.source_version())" 2>/dev/null || echo "(setup.py not importable, skipping)"
+          echo "=== Files in repo root ==="
+          ls -la
+          echo "=== Dockerfile* ==="
+          find . -maxdepth 2 -iname "dockerfile*" -type f
 
       - name: Free disk space
         run: |
@@ -84,6 +84,7 @@ jobs:
           build-args: |
             CUDA_ARCHITECTURES=60
             BUILD_VISION=1
+            STRATA_VERSION=${{ inputs.strata_version }}
           provenance: false
           sbom: false
           cache-from: type=gha,scope=strata-${{ inputs.strata_version }}
