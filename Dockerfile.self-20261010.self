@@ -3,7 +3,7 @@
 # Strata P100 (sm_60) - self-compiled CUDA 12 engine
 # Target: NVIDIA Tesla P100 (compute capability 6.0, Pascal)
 # Base:   CUDA 12.8 (CUDA 13 dropped sm_60 offline compilation)
-# Target Strata: 0.1.40.2
+# Target Strata: 0.1.41
 #
 # The engine is compiled during docker build. On first container start, setup.py
 # finds engine-cuda12/BUILD.json (source=local, matching src hash) and reuses it
