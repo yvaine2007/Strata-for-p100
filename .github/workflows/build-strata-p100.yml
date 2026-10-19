@@ -78,7 +78,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile.self-20261010.self
+          file: ./Dockerfile.self-20261020
           push: true
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
