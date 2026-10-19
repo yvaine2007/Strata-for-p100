@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       strata_version:
-        description: 'Strata 版本号 (格式: v<主>.<次>.<修订>，例如 v0.1.41 或 v0.1.40.2)'
+        description: 'Strata 版本号 (例如 v0.2.0-beta 或 v0.1.41)'
         required: true
         type: string
       use_latest_tag:
@@ -20,16 +20,15 @@ jobs:
       - name: Validate strata version
         run: |
           V="${{ inputs.strata_version }}"
-          if [[ ! "$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+          # 【修改1】支持 -beta 等后缀
+          if [[ ! "$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?$ ]]; then
             echo "❌ 格式不正确: $V"
-            echo "   期望格式: v<主>.<次>.<修订>[.<修订2>]"
-            echo "   例如: v0.1.41 或 v0.1.40.2"
+            echo "   期望格式: v<主>.<次>.<修订>[-后缀]"
+            echo "   例如: v0.1.41, v0.1.40.2 或 v0.2.0-beta"
             exit 1
           fi
           echo "✅ 版本号格式正确: $V"
 
-      # 【关键修改】checkout 你的 fork main，而不是上游 tag
-      # 原因：上游 tag 里没有你的 Dockerfile.self，必须从你的 fork 拿
       - name: Checkout your fork main
         uses: actions/checkout@v4
         with:
@@ -64,6 +63,7 @@ jobs:
         run: |
           REG="${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_REGISTRY_NAMESPACE }}/strata"
           V="${{ inputs.strata_version }}"
+          # 由于 tag 带 -beta，这里清洗一下，避免阿里云镜像 tag 不允许某些字符 (如果阿里云允许 - 就可以保留)
           TAGS="${REG}:${V}-p100"
           if [[ "${{ inputs.use_latest_tag }}" == "true" ]]; then
             TAGS="${TAGS}"$'\n'"${REG}:p100-latest"
@@ -78,6 +78,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          # 如果你的文件名叫 Dockerfile.self-20261020，保持即可
           file: ./Dockerfile.self-20261020
           push: true
           tags: ${{ steps.tags.outputs.tags }}
