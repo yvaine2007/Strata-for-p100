@@ -15,23 +15,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/strata
+# 先把 fork 里的文件复制进来（包含了我们的 Dockerfile）
 COPY . .
 
-# 接收 workflow 传来的参数
 ARG STRATA_VERSION=v0.2.0-beta
 ARG CUDA_ARCHITECTURES=60
 ARG BUILD_VISION=1
 
-# 【修复】放弃 git checkout，改用 wget 直接下载 tarball 并覆盖。
-# 这样可以绕过 GitHub Actions checkout 后没有 .git 目录的问题。
+# 【修复】下载 tarball 并解压覆盖。
+# 注意：解压时 `--strip-components=1` 会去掉顶层目录，直接把文件铺开。
+# 如果里面没有 docker-entrypoint.sh，说明官方把它移走了，所以我们后面的 chmod 必须容错。
 RUN echo "=== Downloading Strata ${STRATA_VERSION} source ===" && \
     wget -qO- "https://github.com/Niko1221/Strata/archive/refs/tags/${STRATA_VERSION}.tar.gz" | tar -xz --strip-components=1 && \
     echo "=== Successfully downloaded ${STRATA_VERSION} source ==="
 
+# 【修复】把 chmod 放到最后，并加上 `|| true` 防止因文件缺失导致中断
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
     && .venv/bin/pip install --no-cache-dir -r requirements.txt \
-    && chmod +x setup.sh docker-entrypoint.sh
+    && chmod +x setup.sh || true \
+    && chmod +x docker-entrypoint.sh || true
 
 # 编译引擎
 RUN .venv/bin/python - <<'PYEOF'
@@ -46,7 +49,6 @@ if nvcc is None:
 arch = os.environ.get("CUDA_ARCHITECTURES", "60").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
-# 主引擎编译：加入 0.2.0 新版默认的 Q6K_EXPERTS 和 MMQ_KQUANTS，保留 AVX2 基线
 setup.cmake_build(setup.ROOT, setup.ROOT / "build-cuda12", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF",
      "-DSTRATA_EXPERIMENTAL_SM60=ON",
@@ -57,7 +59,6 @@ setup.cmake_build(setup.ROOT, setup.ROOT / "build-cuda12", "strata",
      f"-DCMAKE_CUDA_COMPILER={nvcc}",
      f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 
-# 视觉编码器编译
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-cuda12", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
@@ -66,7 +67,6 @@ if vision != "none":
          f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
          f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
 
-# 整理产物并写入 BUILD.json 供 setup.py 识别
 eng = setup.ROOT / "engine-cuda12"
 eng.mkdir(exist_ok=True)
 shutil.copy2(setup.ROOT / "build-cuda12" / setup.EXE, eng / setup.EXE)
@@ -86,7 +86,6 @@ meta = {
 }
 (eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
 
-# 写入版本标记，方便进容器后核对
 pathlib.Path("/opt/strata/REVISION.txt").write_text(
     f"STRATA_VERSION={os.environ.get('STRATA_VERSION', 'unknown')}\n"
 )
