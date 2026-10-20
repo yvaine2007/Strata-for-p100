@@ -104,5 +104,5 @@ jobs:
           provenance: false
           sbom: false
           # 【关键修改】把 scope 改成了 v2，强制 GitHub 放弃之前包含旧版源码的缓存层
-          cache-from: type=gha,scope=strata-p100-v2
-          cache-to: type=gha,mode=max,scope=strata-p100-v2
+          cache-from: type=gha,scope=strata-p100-v3
+          cache-to: type=gha,mode=max,scope=strata-p100-v3
