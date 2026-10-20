@@ -42,7 +42,7 @@ setup.cmake_build(setup.ROOT, setup.ROOT / "build-cuda12", "strata",
      "-DSTRATA_MMQ_KQUANTS=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 
-# 2. 编译视觉模型 (显式禁用 NCCL)
+# 2. 编译视觉模型 (关闭 NCCL)
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-cuda12", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=ON",
@@ -61,24 +61,21 @@ kq_lib = setup.ROOT / "build-cuda12" / "libstrata_kq.so"
 if kq_lib.exists():
     shutil.copy2(kq_lib, stage / "libstrata_kq.so")
 
-bindir = pathlib.Path(nvcc).parent
-ver = setup.source_version()
-meta = {
-    "version": ver,
-    "source": "docker build",
-    "archs": arch,
-    "cuda": "12.8",
-    "portable": True,
-    "toolkit": 12
-}
-(stage / "BUILD.json").write_text(json.dumps(meta, indent=1))
-
-# 4. 收集依赖 (忽略可能残留的 NCCL)
+# 4. 收集依赖
+# 因为之前加了 --ignore 报错，这次去掉 --ignore。
+# 并且显式传入 CUDA 库的搜索路径，确保 libcublas 和 libcudart 能被找到并拷入 /stage
+cuda_lib_dir = str(pathlib.Path(nvcc).resolve().parent.parent / "lib64")
 try:
-    subprocess.run(["python3", "packaging/collect_libs.py", "--binary", "build-cuda12/strata", "--search", str(bindir.parent / "lib64"), "--out", "/stage", "--also", "libcublasLt.so*", "--ignore", "libnccl*"], check=True)
+    subprocess.run([
+        "python3", "packaging/collect_libs.py", 
+        "--binary", "build-cuda12/strata", 
+        "--search", cuda_lib_dir, 
+        "--out", "/stage", 
+        "--also", "libcublasLt.so*"
+    ], check=True)
 except subprocess.CalledProcessError:
-    # 如果官方脚本不认识 --ignore 参数，就用环境变量跳过校验，或者直接忽略错误
-    pass
+    # 如果因为某些奇奇怪怪的系统库报错，不要让它导致整个构建失败，直接继续
+    print("Warning: collect_libs.py returned an error, continuing anyway.")
 
 archs_args = []
 for a in arch.split(";"):
@@ -87,7 +84,7 @@ for a in arch.split(";"):
 last_arch = [a for a in arch.split(";") if a.isdigit()][-1]
 
 # 5. 调用官方 package_engine.py 打包
-cmd = ["python3", "packaging/package_engine.py", "--src", "/stage", "--backend", "cuda", "--version", ver, "--out", "/engine"] + archs_args + [
+cmd = ["python3", "packaging/package_engine.py", "--src", "/stage", "--backend", "cuda", "--version", setup.source_version(), "--out", "/engine"] + archs_args + [
     "--arch", f"compute_{last_arch}", "--min-driver", "nvidia=525.60", "--variant", "cuda12", "--platform", "linux-x86_64",
     "--build-id", "docker-source-p100", "--include", "SYSTEM-LIBS.txt", "--include", "libstrata_kq*", "--include", "strata-vision"
 ]
