@@ -41,12 +41,14 @@ if nvcc is None:
 arch = os.environ.get("CUDA_ARCHITECTURES", "60").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
+# 编译核心引擎
 setup.cmake_build(setup.ROOT, setup.ROOT / "build-cuda12", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_EXPERIMENTAL_SM60=ON",
      "-DSTRATA_PORTABLE=ON", "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_Q6K_EXPERTS=ON",
      "-DSTRATA_MMQ_KQUANTS=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 
+# 编译视觉模型
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-cuda12", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=ON",
@@ -58,6 +60,11 @@ eng.mkdir(exist_ok=True)
 shutil.copy2(setup.ROOT / "build-cuda12" / setup.EXE, eng / setup.EXE)
 if vision != "none":
     shutil.copy2(setup.ROOT / "build-vision-cuda12" / "bin" / setup.VEXE, eng / setup.VEXE)
+
+# 【新增】把缺失的 libstrata_kq.so 拷贝过去
+kq_lib = setup.ROOT / "build-cuda12" / "libstrata_kq.so"
+if kq_lib.exists():
+    shutil.copy2(kq_lib, eng / "libstrata_kq.so")
 
 bindir = pathlib.Path(nvcc).parent
 meta = {
@@ -76,18 +83,16 @@ PYEOF
 RUN rm -rf build-cuda12 build-vision-cuda12
 
 # ==========================================
-# 阶段 2: 生成 Terminal (包含 Python 环境)
+# 阶段 2: 生成 Terminal
 # ==========================================
 FROM ubuntu:24.04 AS terminal
 ARG STRATA_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
-# 【修改点】加上了 python3-venv 和 python3-pip
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-pip ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
-# 下载官方 Terminal 包
 RUN wget -q "https://github.com/Niko1221/Strata/releases/download/${STRATA_VERSION}/strata-terminal-linux-x86_64.tar.gz" -O /tmp/terminal.tar.gz || \
     (echo "Warning: Terminal release not found." && mkdir -p /tmp/terminal && touch /tmp/terminal/dummy)
 
@@ -96,7 +101,6 @@ RUN mkdir -p /opt/strata \
     && if [ -d /opt/strata/strata-terminal-linux-x86_64 ]; then mv /opt/strata/strata-terminal-linux-x86_64 /opt/strata/terminal; fi \
     && if [ ! -d /opt/strata/terminal ]; then mkdir -p /opt/strata/terminal; fi
 
-# 安装 Python 依赖并预取 llama.cpp
 COPY . /src/
 RUN cd /src && python3 -m venv /opt/strata/terminal/python \
     && /opt/strata/terminal/python/bin/pip install --no-cache-dir -r requirements.txt \
@@ -105,9 +109,10 @@ RUN cd /src && python3 -m venv /opt/strata/terminal/python \
     && rm -rf /opt/strata/seed/third_party/*.zip*
 
 # ==========================================
-# 阶段 3: 最终运行镜像
+# 阶段 3: 最终运行镜像 (自带 CUDA 运行库)
 # ==========================================
-FROM ubuntu:24.04
+# 【修改】换成了 runtime 镜像，自带 libcudart.so.12 等
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
