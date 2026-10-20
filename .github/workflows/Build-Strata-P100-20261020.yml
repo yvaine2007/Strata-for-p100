@@ -1,4 +1,4 @@
-name: Build Strata P100 (self-compiled)
+name: Build-Strata-P100-20261020 (self-compiled)
 
 on:
   workflow_dispatch:
