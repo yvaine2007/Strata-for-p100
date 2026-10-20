@@ -6,7 +6,7 @@
 #   - CUDA 12.8.1 (CUDA 13 removed offline compilation for Pascal)
 #   - CMAKE_CUDA_ARCHITECTURES=60-real;60-virtual
 #   - STRATA_EXPERIMENTAL_SM60=ON (P100 kernels)
-#   - STRATA_PORTABLE=ON + STRATA_ISA_FLOOR=avx (runs on any x86-64 AVX2 CPU, e.g. i5-13500H)
+#   - STRATA_PORTABLE=ON (runs on any x86-64 CPU with AVX2; do NOT combine with STRATA_ISA_FLOOR)
 #
 #   docker build -f Dockerfile.p100 -t strata:p100 .
 #   docker run --rm --gpus all -p 127.0.0.1:8080:8080 --ulimit memlock=-1 --shm-size 2g --stop-timeout 120 \
@@ -29,7 +29,6 @@ COPY . .
 ARG CUDA_ARCHITECTURES="60"
 ARG BUILD_VISION=1
 ARG ENGINE_VERSION=
-ARG STRATA_ISA_FLOOR=avx
 
 # Python deps (runtime + build tools, pinned)
 RUN python3 -m venv /venv \
@@ -42,6 +41,10 @@ RUN /venv/bin/python -c "import setup; print(setup.get_llama_cpp())"
 # Compile the engine (strata + strata_kq + strata-vision).  The CUDA arch list is written as
 # "<a>-real;...;<last>-virtual": machine code for each listed arch, plus PTX for the last one so newer
 # cards can JIT (harmless on a single P100, and it keeps the package format the same as the official one).
+#
+# STRATA_PORTABLE=ON is the AVX2 release build (no native instructions from the builder leak into the
+# image).  STRATA_ISA_FLOOR is the opposite, older-CPU build, and CMake refuses the two together, so it
+# is not passed here.
 RUN set -e; \
     real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
@@ -50,7 +53,6 @@ RUN set -e; \
         -DSTRATA_BUILD_TESTS=OFF \
         -DSTRATA_NATIVE_EXPERTS=ON \
         -DSTRATA_PORTABLE=ON \
-        -DSTRATA_ISA_FLOOR=${STRATA_ISA_FLOOR} \
         -DSTRATA_EXPERIMENTAL_SM60=ON \
         -DSTRATA_Q6K_EXPERTS=ON \
         -DSTRATA_MMQ_KQUANTS=ON \
