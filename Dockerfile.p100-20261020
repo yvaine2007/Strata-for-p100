@@ -1,14 +1,11 @@
 # syntax=docker/dockerfile:1
 
-# 【定义全局版本号】
-ARG STRATA_VERSION=v0.2.1
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 # ==========================================
 # 阶段 1: 编译引擎
 # ==========================================
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS engine-build
-ARG STRATA_VERSION
-
+FROM ${BASE_IMAGE} AS engine-build
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/strata
 COPY . .
 
+ARG STRATA_VERSION=v0.2.1
 ARG CUDA_ARCHITECTURES=60
 ARG BUILD_VISION=1
 
@@ -35,37 +33,33 @@ import setup
 
 llama = setup.get_llama_cpp()
 nvcc, _ = setup.find_nvcc(below=(13, 0))
-if nvcc is None:
-    raise SystemExit("no CUDA 12.x toolkit found; the sm_60 build needs one")
-
 arch = os.environ.get("CUDA_ARCHITECTURES", "60").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
-# 编译核心引擎
 setup.cmake_build(setup.ROOT, setup.ROOT / "build-cuda12", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_EXPERIMENTAL_SM60=ON",
      "-DSTRATA_PORTABLE=ON", "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_Q6K_EXPERTS=ON",
      "-DSTRATA_MMQ_KQUANTS=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 
-# 编译视觉模型
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-cuda12", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=ON",
          "-DSTRATA_EXPERIMENTAL_SM60=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
          f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
 
+# 整合引擎包格式 (符合原版 package_engine.py 的预期)
 eng = setup.ROOT / "engine-cuda12"
 eng.mkdir(exist_ok=True)
 shutil.copy2(setup.ROOT / "build-cuda12" / setup.EXE, eng / setup.EXE)
 if vision != "none":
     shutil.copy2(setup.ROOT / "build-vision-cuda12" / "bin" / setup.VEXE, eng / setup.VEXE)
 
-# 【新增】把缺失的 libstrata_kq.so 拷贝过去
 kq_lib = setup.ROOT / "build-cuda12" / "libstrata_kq.so"
 if kq_lib.exists():
     shutil.copy2(kq_lib, eng / "libstrata_kq.so")
 
+# 给原版 verify 阶段用的必要文件
 bindir = pathlib.Path(nvcc).parent
 meta = {
     "source": "local",
@@ -78,59 +72,37 @@ meta = {
     "toolkit": 12,
 }
 (eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
+(eng / "engine-component.json").write_text(json.dumps({"flavor": "cuda12", **meta}, indent=1))
 PYEOF
-
-RUN rm -rf build-cuda12 build-vision-cuda12
 
 # ==========================================
 # 阶段 2: 生成 Terminal
 # ==========================================
 FROM ubuntu:24.04 AS terminal
 ARG STRATA_VERSION
-
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-pip ca-certificates wget \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pip ca-certificates wget && rm -rf /var/lib/apt/lists/*
 
-RUN wget -q "https://github.com/Niko1221/Strata/releases/download/${STRATA_VERSION}/strata-terminal-linux-x86_64.tar.gz" -O /tmp/terminal.tar.gz || \
-    (echo "Warning: Terminal release not found." && mkdir -p /tmp/terminal && touch /tmp/terminal/dummy)
-
-RUN mkdir -p /opt/strata \
-    && tar -xzf /tmp/terminal.tar.gz -C /opt/strata --strip-components=1 2>/dev/null || true \
-    && if [ -d /opt/strata/strata-terminal-linux-x86_64 ]; then mv /opt/strata/strata-terminal-linux-x86_64 /opt/strata/terminal; fi \
-    && if [ ! -d /opt/strata/terminal ]; then mkdir -p /opt/strata/terminal; fi
-
-COPY . /src/
-RUN cd /src && python3 -m venv /opt/strata/terminal/python \
-    && /opt/strata/terminal/python/bin/pip install --no-cache-dir -r requirements.txt \
-    && STRATA_CONTROL_INSTALL=1 STRATA_INSTALL_DIR=/opt/strata/seed PYTHONNOUSERSITE=1 \
-       /opt/strata/terminal/python/bin/python3 -c "import setup; print(setup.get_llama_cpp())" \
-    && rm -rf /opt/strata/seed/third_party/*.zip*
+# 官方在 releases 里确实没有放独立 tar.gz，我们在原版里直接使用源码包打包
+COPY --from=engine-build /opt/strata /opt/strata
+RUN python3 /opt/strata/packaging/package_terminal.py --out /out --cache /cache \
+    && mkdir -p /opt/strata/terminal \
+    && tar -xzf /out/strata-terminal-*-linux-x86_64.tar.gz -C /opt/strata/terminal --strip-components=1 \
+    && /opt/strata/terminal/bin/strata --version
 
 # ==========================================
-# 阶段 3: 最终运行镜像 (自带 CUDA 运行库)
+# 阶段 3: 最终运行镜像 (自带 CUDA 12.8 运行库)
 # ==========================================
-# 【修改】换成了 runtime 镜像，自带 libcudart.so.12 等
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
-
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g curl wget \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g curl wget && rm -rf /var/lib/apt/lists/*
 
 COPY --from=terminal /opt/strata/terminal /opt/strata/terminal
-COPY --from=terminal /opt/strata/seed /opt/strata/seed
-COPY --from=engine-build /opt/strata/engine-cuda12 /opt/strata/engine-cuda12
-
-RUN mkdir -p /opt/strata/components/engine \
-    && cp -r /opt/strata/engine-cuda12/* /opt/strata/components/engine/ \
-    && ln -sf /opt/strata/terminal/bin/strata /usr/local/bin/strata || true
-
+COPY --from=engine-build /opt/strata/engine-cuda12 /opt/strata/components/engine/engine-cuda12
 COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
 COPY docker/strata-wrapper.sh /usr/local/bin/strata
 
-RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata /opt/strata/terminal/bin/* 2>/dev/null || true
+RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata
 
 ENV STRATA_COMPONENTS_DIR=/opt/strata/components \
     STRATA_INSTALL_DIR=/data/install \
@@ -142,10 +114,7 @@ ENV STRATA_COMPONENTS_DIR=/opt/strata/components \
 
 VOLUME ["/data"]
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
-  CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
-
+HEALTHCHECK --interval=30s --timeout=8s --start-period=2h --retries=3 CMD ["/opt/strata/healthcheck.sh"]
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/strata/entrypoint.sh"]
 CMD ["run"]
