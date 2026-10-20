@@ -1,0 +1,155 @@
+# syntax=docker/dockerfile:1
+#
+# Strata for NVIDIA Tesla P100 (sm_60, Pascal) - self-compiled CUDA 12 engine.
+#
+# Based on the repository's docker/Dockerfile.source (CUDA 13), with the engine stage swapped to:
+#   - CUDA 12.8.1 (CUDA 13 removed offline compilation for Pascal)
+#   - CMAKE_CUDA_ARCHITECTURES=60-real;60-virtual
+#   - STRATA_EXPERIMENTAL_SM60=ON (P100 kernels)
+#   - STRATA_PORTABLE=ON + STRATA_ISA_FLOOR=avx (runs on any x86-64 AVX2 CPU, e.g. i5-13500H)
+#
+#   docker build -f Dockerfile.p100 -t strata:p100 .
+#   docker run --rm --gpus all -p 127.0.0.1:8080:8080 --ulimit memlock=-1 --shm-size 2g --stop-timeout 120 \
+#              -v strata-data:/data -e MODEL=IQ2_XS strata:p100
+#
+# Most people want the ready-made images instead (docs/DOCKER.md).
+
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04
+ARG RUNTIME_BASE=ubuntu:24.04
+
+# ---- 1. compile the engine and make its component package -------------------
+FROM ${CUDA_IMAGE} AS engine-build
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PATH=/venv/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates git libgomp1 libatomic1 python3 python3-pip python3-venv unzip \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+
+ARG CUDA_ARCHITECTURES="60"
+ARG BUILD_VISION=1
+ARG ENGINE_VERSION=
+ARG STRATA_ISA_FLOOR=avx
+
+# Python deps (runtime + build tools, pinned)
+RUN python3 -m venv /venv \
+ && /venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-build.txt
+
+# llama.cpp at the pinned commit (ggml for the engine, gguf-py for the tools), exactly as setup.py fetches it
+RUN /venv/bin/python -c "import setup; print(setup.get_llama_cpp())"
+
+# Compile the engine (strata + strata_kq + strata-vision).  The CUDA arch list is written as
+# "<a>-real;...;<last>-virtual": machine code for each listed arch, plus PTX for the last one so newer
+# cards can JIT (harmless on a single P100, and it keeps the package format the same as the official one).
+RUN set -e; \
+    real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
+    last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
+    /venv/bin/cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release \
+        -DSTRATA_ENABLE_CUDA=ON \
+        -DSTRATA_BUILD_TESTS=OFF \
+        -DSTRATA_NATIVE_EXPERTS=ON \
+        -DSTRATA_PORTABLE=ON \
+        -DSTRATA_ISA_FLOOR=${STRATA_ISA_FLOOR} \
+        -DSTRATA_EXPERIMENTAL_SM60=ON \
+        -DSTRATA_Q6K_EXPERTS=ON \
+        -DSTRATA_MMQ_KQUANTS=ON \
+        "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" \
+        -DSTRATA_GGML_DIR=/src/third_party/llama.cpp; \
+    /venv/bin/cmake --build build --target strata strata_kq -j "$(nproc)"; \
+    if [ "$BUILD_VISION" = "1" ]; then \
+      /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release \
+          -DLLAMA_DIR=/src/third_party/llama.cpp \
+          -DSTRATA_VISION_CUDA=ON \
+          -DSTRATA_PORTABLE=ON \
+          -DSTRATA_EXPERIMENTAL_SM60=ON \
+          -DGGML_CUDA_NCCL=OFF \
+          "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
+      /venv/bin/cmake --build build-vision --target strata-vision -j "$(nproc)"; \
+    fi
+
+# Package the engine as a component (BUILD.json + SYSTEM-LIBS.txt + binary_deps), same format the
+# ready-made releases use, so strata_control/engine_component.py can resolve it at runtime.
+RUN set -e; \
+    mkdir -p /stage /engine; \
+    cp build/strata /stage/; \
+    [ -f build/libstrata_kq.so ] && cp build/libstrata_kq.so /stage/ || true; \
+    [ -f build-vision/bin/strata-vision ] && cp build-vision/bin/strata-vision /stage/ || true; \
+    ver="${ENGINE_VERSION:-$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)}"; \
+    echo "{\"version\": \"$ver\", \"source\": \"docker build\", \"archs\": \"$CUDA_ARCHITECTURES\", \"cuda\": \"12.8\", \"portable\": true, \"toolkit\": 12}" > /stage/BUILD.json; \
+    python3 packaging/collect_libs.py --binary build/strata --search /usr/local/cuda/lib64 --out /stage --also 'libcublasLt.so*'; \
+    archs=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do archs="$archs --arch sm_$a"; done; \
+    last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
+    python3 packaging/package_engine.py --src /stage --backend cuda --version "$ver" --out /engine $archs \
+        --arch "compute_$last" \
+        --min-driver nvidia=528.00 \
+        --variant cuda12 \
+        --platform linux-x86_64 \
+        --build-id "docker-source-${ver}-cuda12.8" \
+        --include SYSTEM-LIBS.txt \
+        --include 'libstrata_kq*' \
+        --include strata-vision; \
+    for d in /engine/*/; do python3 packaging/package_engine.py --verify "$d"; python3 packaging/binary_deps.py "$d"; done
+
+# ---- 2. the Terminal (the release archive, built here) ---------------------
+FROM ${RUNTIME_BASE} AS terminal
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY . /src/
+RUN python3 /src/packaging/package_terminal.py --out /out --cache /cache \
+ && mkdir -p /opt/strata \
+ && tar -xzf /out/strata-terminal-*-linux-x86_64.tar.gz -C /opt/strata \
+ && mv /opt/strata/strata-terminal-* /opt/strata/terminal \
+ && /opt/strata/terminal/bin/strata --version
+
+# llama.cpp at the commit setup.py pins: fetched here, so the first start does not depend on GitHub.
+# Only gguf-py (the model preparation tools) and the file setup.py looks for (ggml/CMakeLists.txt) are kept.
+RUN cd /opt/strata/terminal && STRATA_CONTROL_INSTALL=1 STRATA_INSTALL_DIR=/opt/strata/seed PYTHONNOUSERSITE=1 \
+      /opt/strata/terminal/python/bin/python3 -c "import setup; print(setup.get_llama_cpp())" \
+ && rm -rf /opt/strata/seed/third_party/*.zip* \
+ && cd /opt/strata/seed/third_party/llama.cpp \
+ && find . -mindepth 1 -maxdepth 1 ! -name gguf-py ! -name ggml ! -name 'LICENSE*' -exec rm -rf {} + \
+ && find ggml -mindepth 1 -depth ! -type d ! -name CMakeLists.txt -delete \
+ && find ggml -mindepth 1 -type d -empty -delete \
+ && du -sh /opt/strata/seed
+
+# ---- 3. the runtime image (same as docker/Dockerfile, FLAVOR=cuda) ---------
+FROM ${RUNTIME_BASE}
+ARG STRATA_VERSION=dev
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+COPY --from=terminal /opt/strata/terminal /opt/strata/terminal
+COPY --from=terminal /opt/strata/seed /opt/strata/seed
+COPY --from=engine-build /engine/ /opt/strata/components/engine/
+COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
+COPY docker/strata-wrapper.sh /usr/local/bin/strata
+RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata
+
+ENV STRATA_COMPONENTS_DIR=/opt/strata/components \
+    STRATA_INSTALL_DIR=/data/install \
+    XDG_STATE_HOME=/data/state \
+    XDG_CONFIG_HOME=/data/config \
+    HOME=/data/home \
+    PORT=8080 \
+    LANG=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONNOUSERSITE=1 \
+    STRATA_IN_DOCKER=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+VOLUME ["/data"]
+EXPOSE 8080
+LABEL org.opencontainers.image.title="Strata (P100 / CUDA 12)" \
+      com.strata.flavor="cuda" \
+      com.strata.build="from-source-p100" \
+      com.strata.arch="sm_60" \
+      org.opencontainers.image.version="${STRATA_VERSION}"
+
+HEALTHCHECK --interval=30s --timeout=8s --start-period=2h --retries=3 CMD ["/opt/strata/healthcheck.sh"]
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/strata/entrypoint.sh"]
+CMD ["run"]
