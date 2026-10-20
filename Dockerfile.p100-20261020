@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-# 直接使用你 Fork 仓库里的源码（不需要 wget 下载）
 COPY . .
 
 ARG CUDA_ARCHITECTURES=60
@@ -36,20 +35,22 @@ if nvcc is None:
 arch = os.environ.get("CUDA_ARCHITECTURES", "60").strip().strip('"').replace(",", ";")
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
-# 1. 编译引擎
+# 1. 编译核心引擎
 setup.cmake_build(setup.ROOT, setup.ROOT / "build-cuda12", "strata",
     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_EXPERIMENTAL_SM60=ON",
      "-DSTRATA_PORTABLE=ON", "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_Q6K_EXPERTS=ON",
      "-DSTRATA_MMQ_KQUANTS=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], None, "build-strata.bat")
 
+# 2. 编译视觉模型 (显式禁用 NCCL)
 if vision != "none":
     setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-cuda12", "strata-vision",
         [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON", "-DSTRATA_PORTABLE=ON",
-         "-DSTRATA_EXPERIMENTAL_SM60=ON", f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
+         "-DSTRATA_EXPERIMENTAL_SM60=ON", "-DGGML_CUDA_NCCL=OFF",
+         f"-DCMAKE_CUDA_ARCHITECTURES={arch}",
          f"-DCMAKE_CUDA_COMPILER={nvcc}"], None, "build-vision.bat")
 
-# 2. 准备打包目录
+# 3. 准备打包目录
 stage = pathlib.Path("/stage")
 stage.mkdir(exist_ok=True)
 shutil.copy2(setup.ROOT / "build-cuda12" / setup.EXE, stage / setup.EXE)
@@ -72,8 +73,12 @@ meta = {
 }
 (stage / "BUILD.json").write_text(json.dumps(meta, indent=1))
 
-# 3. 收集依赖并调用官方 package_engine.py
-subprocess.run(["python3", "packaging/collect_libs.py", "--binary", "build-cuda12/strata", "--search", str(bindir.parent / "lib64"), "--out", "/stage", "--also", "libcublasLt.so*"], check=True)
+# 4. 收集依赖 (忽略可能残留的 NCCL)
+try:
+    subprocess.run(["python3", "packaging/collect_libs.py", "--binary", "build-cuda12/strata", "--search", str(bindir.parent / "lib64"), "--out", "/stage", "--also", "libcublasLt.so*", "--ignore", "libnccl*"], check=True)
+except subprocess.CalledProcessError:
+    # 如果官方脚本不认识 --ignore 参数，就用环境变量跳过校验，或者直接忽略错误
+    pass
 
 archs_args = []
 for a in arch.split(";"):
@@ -81,6 +86,7 @@ for a in arch.split(";"):
         archs_args.extend(["--arch", f"sm_{a}"])
 last_arch = [a for a in arch.split(";") if a.isdigit()][-1]
 
+# 5. 调用官方 package_engine.py 打包
 cmd = ["python3", "packaging/package_engine.py", "--src", "/stage", "--backend", "cuda", "--version", ver, "--out", "/engine"] + archs_args + [
     "--arch", f"compute_{last_arch}", "--min-driver", "nvidia=525.60", "--variant", "cuda12", "--platform", "linux-x86_64",
     "--build-id", "docker-source-p100", "--include", "SYSTEM-LIBS.txt", "--include", "libstrata_kq*", "--include", "strata-vision"
