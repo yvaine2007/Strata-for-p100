@@ -47,17 +47,18 @@ jobs:
           echo "=== Dockerfile* ==="
           find . -maxdepth 2 -iname "dockerfile*" -type f
           echo "=== Required for the build ==="
+          # 【修改】将文件名改成了你实际使用的 Dockerfile.p100-20261020
           for f in setup.py requirements.txt requirements-build.txt CMakeLists.txt \
                    docker/entrypoint.sh docker/healthcheck.sh docker/strata-wrapper.sh \
                    packaging/package_terminal.py packaging/package_engine.py packaging/collect_libs.py \
-                   Dockerfile.p100; do
+                   Dockerfile.p100-20261020; do
             [ -e "$f" ] && echo "OK   $f" || echo "MISS $f"
           done
 
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/share/chromium
+          sudo rm -rf /usr/local/share/boost /usr/local/share/swift /usr/local/share/chromium
           sudo rm -rf /usr/local/cuda-*/nsight* || true
           docker image prune -af || true
           df -h /
@@ -102,5 +103,6 @@ jobs:
             STRATA_VERSION=${{ inputs.strata_version }}
           provenance: false
           sbom: false
-          cache-from: type=gha,scope=strata-p100
-          cache-to: type=gha,mode=max,scope=strata-p100
+          # 【关键修改】把 scope 改成了 v2，强制 GitHub 放弃之前包含旧版源码的缓存层
+          cache-from: type=gha,scope=strata-p100-v2
+          cache-to: type=gha,mode=max,scope=strata-p100-v2
