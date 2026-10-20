@@ -1,0 +1,106 @@
+name: Build Strata P100 (self-compiled)
+
+on:
+  workflow_dispatch:
+    inputs:
+      strata_version:
+        description: 'Strata 版本号 (例如 v0.2.0-beta 或 v0.1.41)'
+        required: true
+        type: string
+      use_latest_tag:
+        description: '是否同时打 p100-latest 标签'
+        required: true
+        type: boolean
+        default: true
+      build_vision:
+        description: '编译 vision (strata-vision)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Validate strata version
+        run: |
+          V="${{ inputs.strata_version }}"
+          if [[ ! "$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?$ ]]; then
+            echo "❌ 格式不正确: $V"
+            echo "   期望格式: v<主>.<次>.<修订>[-后缀]"
+            echo "   例如: v0.1.41, v0.1.40.2 或 v0.2.0-beta"
+            exit 1
+          fi
+          echo "✅ 版本号格式正确: $V"
+
+      - name: Checkout your fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Debug - verify required files
+        run: |
+          echo "=== Files in repo root ==="
+          ls -la
+          echo "=== Dockerfile* ==="
+          find . -maxdepth 2 -iname "dockerfile*" -type f
+          echo "=== Required for the build ==="
+          for f in setup.py requirements.txt requirements-build.txt CMakeLists.txt \
+                   docker/entrypoint.sh docker/healthcheck.sh docker/strata-wrapper.sh \
+                   packaging/package_terminal.py packaging/package_engine.py packaging/collect_libs.py \
+                   Dockerfile.p100; do
+            [ -e "$f" ] && echo "OK   $f" || echo "MISS $f"
+          done
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost /usr/share/swift /usr/local/share/chromium
+          sudo rm -rf /usr/local/cuda-*/nsight* || true
+          docker image prune -af || true
+          df -h /
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USER }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: tags
+        run: |
+          REG="${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_REGISTRY_NAMESPACE }}/strata"
+          V="${{ inputs.strata_version }}"
+          TAGS="${REG}:${V}-p100"
+          TAGS="${TAGS}"$'\n'"${REG}:p100-${GITHUB_SHA::7}"
+          if [[ "${{ inputs.use_latest_tag }}" == "true" ]]; then
+            TAGS="${TAGS}"$'\n'"${REG}:p100-latest"
+          fi
+          echo "tags<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "将推送以下 tag:"
+          echo "$TAGS"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.p100-20261020
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            CUDA_ARCHITECTURES=60
+            BUILD_VISION=${{ inputs.build_vision && '1' || '0' }}
+            STRATA_VERSION=${{ inputs.strata_version }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=strata-p100
+          cache-to: type=gha,mode=max,scope=strata-p100
