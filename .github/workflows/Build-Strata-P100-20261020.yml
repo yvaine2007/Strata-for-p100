@@ -101,6 +101,7 @@ jobs:
             CUDA_ARCHITECTURES=60
             BUILD_VISION=${{ inputs.build_vision && '1' || '0' }}
             STRATA_VERSION=${{ inputs.strata_version }}
+            STRATA_COMMIT=${{ github.sha }}
           provenance: false
           sbom: false
           # 【关键修改】把 scope 改成了 v2，强制 GitHub 放弃之前包含旧版源码的缓存层
