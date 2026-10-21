@@ -95,6 +95,8 @@ PYEOF
 # 阶段 2: 生成 Terminal (官方原版脚本)
 # ==========================================
 FROM ubuntu:24.04 AS terminal
+ARG STRATA_COMMIT=
+ENV STRATA_BUILD_COMMIT=${STRATA_COMMIT}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates wget && rm -rf /var/lib/apt/lists/*
 
